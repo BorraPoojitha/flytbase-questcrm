@@ -73,6 +73,183 @@ const cache: {
 
 const UNKNOWN_VALUE = "Unknown";
 
+function makeEmptySnapshot(message = "No data available yet."): DashboardSnapshot {
+  return {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "error",
+    message,
+    rateLimit: {
+      perMinute: 1,
+      nextAvailableAt: null,
+      lastRequestAt: null,
+    },
+  };
+}
+
+function findNestedRecordCandidates(value: unknown, out: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (!value || typeof value !== "object") {
+    return out;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((entry) => findNestedRecordCandidates(entry, out));
+    return out;
+  }
+
+  const record = value as Record<string, unknown>;
+  const looksLikeRecord =
+    typeof record.name === "string" ||
+    typeof record.account === "string" ||
+    typeof record.company === "string" ||
+    typeof record.entity === "string" ||
+    typeof record.account_name === "string" ||
+    typeof record.customer === "string" ||
+    Array.isArray(record.stakeholders) ||
+    Array.isArray(record.deals) ||
+    Array.isArray(record.offers) ||
+    Array.isArray(record.opportunities) ||
+    Array.isArray(record.facts) ||
+    Array.isArray(record.risks);
+
+  if (looksLikeRecord) {
+    out.push(record);
+  }
+
+  Object.values(record).forEach((nested) => findNestedRecordCandidates(nested, out));
+  return out;
+}
+
+function extractExportRecords(exportPayload: unknown): Record<string, unknown>[] {
+  if (!exportPayload) return [];
+
+  if (Array.isArray(exportPayload)) {
+    return exportPayload.filter((item): item is Record<string, unknown> => !!item && typeof item === "object");
+  }
+
+  if (typeof exportPayload === "object") {
+    const root = exportPayload as Record<string, unknown>;
+    const directCandidates = [
+      root.data,
+      root.records,
+      root.items,
+      root.results,
+      root.accounts,
+      root.deals,
+      root.clients,
+      root.partners,
+      root.customers,
+      root.entities,
+    ];
+
+    for (const candidate of directCandidates) {
+      const values = Array.isArray(candidate)
+        ? candidate.filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+        : candidate && typeof candidate === "object"
+          ? [candidate as Record<string, unknown>]
+          : [];
+      if (values.length > 0) {
+        return values;
+      }
+    }
+
+    const nested = findNestedRecordCandidates(root);
+    if (nested.length > 0) return nested;
+  }
+
+  return [];
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => toStringValue(entry))
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  const str = toStringValue(value).trim();
+  return str && str !== UNKNOWN_VALUE ? [str] : [];
+}
+
+function coerceAccountName(value: unknown): string | null {
+  const raw = toStringValue(value).trim();
+  if (!raw || raw === UNKNOWN_VALUE) return null;
+  return raw;
+}
+
+function readNestedValue(record: Record<string, unknown>, path: string[]): unknown {
+  let current: unknown = record;
+  for (const segment of path) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function recordMatchesTargetAccount(record: Record<string, unknown>): boolean {
+  const candidateNames = [
+    coerceAccountName(record.account),
+    coerceAccountName(record.company),
+    coerceAccountName(record.entity),
+    coerceAccountName(record.name),
+    coerceAccountName(record.account_name),
+    coerceAccountName(record.customer),
+    ...normalizeStringArray(readNestedValue(record, ["account", "name"])),
+    ...normalizeStringArray(readNestedValue(record, ["company", "name"])),
+  ].filter((value): value is string => !!value);
+
+  if (candidateNames.length === 0) return false;
+  return candidateNames.some((name) => ACCOUNT_NAMES.some((target) => target.toLowerCase() === name.toLowerCase()));
+}
+
+function DEFAULT_SNAPSHOT(): DashboardSnapshot {
+  return {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "idle",
+    message: "Sync has not run yet.",
+    rateLimit: {
+      perMinute: 1,
+      nextAvailableAt: null,
+      lastRequestAt: null,
+    },
+  };
+}
+
+function UNKNOWN_SNAPSHOT(message: string): DashboardSnapshot {
+  return {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "error",
+    message,
+    rateLimit: {
+      perMinute: 1,
+      nextAvailableAt: null,
+      lastRequestAt: null,
+    },
+  };
+}
+
+function getSyncErrorSnapshot(message: string): DashboardSnapshot {
+  return {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "error",
+    message,
+    rateLimit: {
+      perMinute: 1,
+      nextAvailableAt: null,
+      lastRequestAt: null,
+    },
+  };
+}
+
+function isEmptyDashboardSnapshot(snapshot: DashboardSnapshot | null | undefined): boolean {
+  if (!snapshot) return true;
+  return !snapshot.lastSyncedAt && snapshot.accounts.every((account) => account.bookValue.every((field) => field.value === UNKNOWN_VALUE));
+}
+
 function normalizeStatus(value: unknown): SourceStatus {
   const raw = String(value ?? "").trim().toLowerCase();
   if (["verified", "confirmed", "checked", "validated"].includes(raw)) return "verified";
@@ -268,9 +445,21 @@ function buildAccountSet(records: Record<string, unknown>[]): AccountCard[] {
   const byName = new Map<string, Record<string, unknown>>();
 
   records.forEach((record) => {
-    const name = matchAccountName(findAccountName(record));
-    if (!name || name === "Unknown account") return;
-    byName.set(name, record);
+    const candidateNames = [
+      findAccountName(record),
+      coerceAccountName(record.account),
+      coerceAccountName(record.company),
+      coerceAccountName(record.entity),
+      coerceAccountName(record.name),
+      coerceAccountName(record.account_name),
+      coerceAccountName(record.customer),
+    ].filter((value): value is string => !!value);
+
+    for (const candidate of candidateNames) {
+      const matched = matchAccountName(candidate);
+      if (!matched || matched === "Unknown account") continue;
+      byName.set(matched, record);
+    }
   });
 
   const accounts = ACCOUNT_NAMES.map((accountName) => {
@@ -281,7 +470,15 @@ function buildAccountSet(records: Record<string, unknown>[]): AccountCard[] {
   return accounts.filter((account) => account.name !== "Unknown account");
 }
 
-export async function requestQuestathon<T>(path: string, init: RequestInit = {}): Promise<T | null> {
+function normalizeAccountPayload(exportPayload: unknown): AccountCard[] {
+  const candidateRecords = extractExportRecords(exportPayload);
+  const targetRecords = candidateRecords.filter((record) => recordMatchesTargetAccount(record));
+  const normalized = buildAccountSet(targetRecords.length > 0 ? targetRecords : candidateRecords);
+
+  return normalized.length > 0 ? normalized : ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
+}
+
+async function requestQuestathon<T>(path: string, init: RequestInit = {}): Promise<T | null> {
   const token = process.env.AQ_TOKEN;
   if (!token) {
     return null;
