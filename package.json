@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "migrate": "node scripts/migrate.js",
-    "test:questathon-cache": "node --test src/lib/questathon.test.mjs"
+    "test:questathon-cache": "node --experimental-strip-types --test src/lib/questathon.test.mjs"
   },
   "dependencies": {
     "next": "16.4.6",
