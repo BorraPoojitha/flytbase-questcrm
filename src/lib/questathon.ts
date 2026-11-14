@@ -493,7 +493,137 @@ function normalizeAccountPayload(exportPayload: unknown): AccountCard[] {
   const targetRecords = candidateRecords.filter((record) => recordMatchesTargetAccount(record));
   const normalized = buildAccountSet(targetRecords.length > 0 ? targetRecords : candidateRecords);
 
-  return normalized.length > 0 ? normalized : ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
+  const matches = normalized.length > 0 ? normalized : ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
+  const readySnapshot: DashboardSnapshot = {
+    accounts: matches,
+    lastSyncedAt: new Date().toISOString(),
+    status: "ready",
+    message: "Questathon sync completed.",
+    rateLimit: {
+      perMinute: 1,
+      nextAvailableAt: null,
+      lastRequestAt: null,
+    },
+  };
+
+  logSafeSyncDiagnostics(readySnapshot, {
+    accountMatches: matches.length,
+    candidateRecords: exportPayload && typeof exportPayload === "object" ? Object.keys(exportPayload as Record<string, unknown>).length : 0,
+    targetMatches: matches.filter((account) => account.name !== "Unknown account").length,
+  });
+  return matches;
+}
+
+const DASHBOARD_CACHE_KEY = "questathon-dashboard";
+const REFRESH_IN_FLIGHT_KEY = "questathon-dashboard-refresh-in-flight";
+const LAST_REQUEST_AT_KEY = "questathon-last-request-at";
+const RATE_LIMIT_MS = 60000;
+
+function buildRateLimit(rateLimit: { perMinute: number; nextAvailableAt: string | null; lastRequestAt: string | null }): DashboardSnapshot["rateLimit"] {
+  return {
+    perMinute: rateLimit.perMinute,
+    nextAvailableAt: rateLimit.nextAvailableAt,
+    lastRequestAt: rateLimit.lastRequestAt,
+  };
+}
+
+function statusRateLimit(nextAvailableAtMs: number | null, lastRequestAtMs: number | null): DashboardSnapshot["rateLimit"] {
+  return {
+    perMinute: 1,
+    nextAvailableAt: nextAvailableAtMs ? new Date(nextAvailableAtMs).toISOString() : null,
+    lastRequestAt: lastRequestAtMs ? new Date(lastRequestAtMs).toISOString() : null,
+  };
+}
+
+function buildStaleSnapshot(snapshot: DashboardSnapshot | null, message: string, nextAvailableAtMs: number | null, lastRequestAtMs: number | null): DashboardSnapshot {
+  const fallback = snapshot ?? {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "stale",
+    message,
+    rateLimit: statusRateLimit(nextAvailableAtMs, lastRequestAtMs),
+  };
+
+  return {
+    ...fallback,
+    status: "stale",
+    message,
+    rateLimit: statusRateLimit(nextAvailableAtMs, fallback.rateLimit.lastRequestAt ? Date.parse(fallback.rateLimit.lastRequestAt) : lastRequestAtMs),
+  };
+}
+
+function buildRefreshInProgressSnapshot(snapshot: DashboardSnapshot | null, nextAvailableAtMs: number | null, lastRequestAtMs: number | null): DashboardSnapshot {
+  const message = "A Questathon refresh is already running. Waiting for the latest valid data.";
+  const fallback = snapshot ?? {
+    accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+    lastSyncedAt: null,
+    status: "stale",
+    message,
+    rateLimit: statusRateLimit(nextAvailableAtMs, lastRequestAtMs),
+  };
+
+  return {
+    ...fallback,
+    status: "stale",
+    message,
+    rateLimit: statusRateLimit(nextAvailableAtMs, fallback.rateLimit.lastRequestAt ? Date.parse(fallback.rateLimit.lastRequestAt) : lastRequestAtMs),
+  };
+}
+
+function isUnknownResourceValue(value: unknown): boolean {
+  const raw = String(value ?? "").trim().toLowerCase();
+  return raw === "" || ["unknown", "unknown account", "n/a", "na", "none", "not available", "null", "undefined"].includes(raw);
+}
+
+function isAccountSlotReady(account: AccountCard | null | undefined): boolean {
+  if (!account) return false;
+  const name = String(account.name ?? "").trim();
+  const id = String(account.id ?? "").trim();
+  return name.length > 0 && !isUnknownResourceValue(name) && id.length > 0 && !isUnknownResourceValue(id);
+}
+
+export function isDashboardSnapshotValid(snapshot: DashboardSnapshot | null | undefined): boolean {
+  if (!snapshot || !Array.isArray(snapshot.accounts) || snapshot.accounts.length < 2) {
+    return false;
+  }
+
+  return snapshot.accounts.slice(0, 2).every((account) => isAccountSlotReady(account));
+}
+
+export function decideDashboardRefresh(snapshot: DashboardSnapshot | null, opts: { inFlight: boolean; nowMs: number; nextAvailableAtMs: number | null }): { action: "reuse" | "refresh" | "stale"; snapshot: DashboardSnapshot | null; nextAvailableAt: string | null } {
+  if (!snapshot || !snapshot.lastSyncedAt) {
+    return { action: "refresh", snapshot: null, nextAvailableAt: null };
+  }
+
+  if (isDashboardSnapshotValid(snapshot)) {
+    return { action: "reuse", snapshot, nextAvailableAt: snapshot.rateLimit.nextAvailableAt ?? null };
+  }
+
+  if (opts.inFlight) {
+    return {
+      action: "stale",
+      snapshot: buildRefreshInProgressSnapshot(snapshot, opts.nextAvailableAtMs, cache.lastRequestAt ?? (snapshot.rateLimit.lastRequestAt ? Date.parse(snapshot.rateLimit.lastRequestAt) : null)),
+      nextAvailableAt: opts.nextAvailableAtMs ? new Date(opts.nextAvailableAtMs).toISOString() : null,
+    };
+  }
+
+  if (opts.nextAvailableAtMs && opts.nowMs < opts.nextAvailableAtMs) {
+    return {
+      action: "stale",
+      snapshot: buildStaleSnapshot(snapshot, "Persisted dashboard snapshot is invalid. A refresh is queued, but the Questathon request rate limit is still active.", opts.nextAvailableAtMs, cache.lastRequestAt ?? (snapshot.rateLimit.lastRequestAt ? Date.parse(snapshot.rateLimit.lastRequestAt) : null)),
+      nextAvailableAt: new Date(opts.nextAvailableAtMs).toISOString(),
+    };
+  }
+
+  return {
+    action: "refresh",
+    snapshot,
+    nextAvailableAt: opts.nextAvailableAtMs ? new Date(opts.nextAvailableAtMs).toISOString() : null,
+  };
+}
+
+async function getRateLimitState(): Promise<{ lastRequestAt: number | null }> {
+  return loadPersistenceState<{ lastRequestAt: number | null }>(LAST_REQUEST_AT_KEY, { lastRequestAt: null });
 }
 
 async function requestQuestathon<T>(path: string, init: RequestInit = {}): Promise<T | null> {
@@ -502,16 +632,18 @@ async function requestQuestathon<T>(path: string, init: RequestInit = {}): Promi
     return null;
   }
 
-  const now = Date.now();
-  const gap = cache.lastRequestAt ? now - cache.lastRequestAt : Number.POSITIVE_INFINITY;
+  const rateLimitState = await getRateLimitState();
+  const lastKnownRequestAt = cache.lastRequestAt ?? rateLimitState.lastRequestAt ?? null;
+  const nextAllowedAt = lastKnownRequestAt ? lastKnownRequestAt + RATE_LIMIT_MS : null;
 
-  if (gap < 60000) {
-    const waitTime = 60000 - gap;
+  if (nextAllowedAt && Date.now() < nextAllowedAt) {
+    const waitTime = nextAllowedAt - Date.now();
     await new Promise((resolve) => setTimeout(resolve, waitTime));
   }
 
   cache.lastRequestAt = Date.now();
-  cache.nextRequestAt = cache.lastRequestAt + 60000;
+  cache.nextRequestAt = cache.lastRequestAt + RATE_LIMIT_MS;
+  await savePersistenceState(LAST_REQUEST_AT_KEY, { lastRequestAt: cache.lastRequestAt });
 
   const response = await fetch(`${process.env.QUESTATHON_BASE_URL || "https://questathon.aihackerscollective.com"}${path}`, {
     ...init,
@@ -531,7 +663,7 @@ async function requestQuestathon<T>(path: string, init: RequestInit = {}): Promi
 }
 
 async function fetchAndNormalizeExport(): Promise<AccountCard[]> {
-  const exportPayload = await requestQuestathon<Record<string, unknown> | Record<string, unknown>[] | unknown[]>("/api/public/v1/export");
+  const exportPayload = await requestQuestathon<Record<string, unknown> | Record<string, unknown>[] | unknown[]>('/api/public/v1/export');
   if (!exportPayload) return ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
 
   const normalized = normalizeAccountPayload(exportPayload);
@@ -540,13 +672,14 @@ async function fetchAndNormalizeExport(): Promise<AccountCard[]> {
 
 async function maybeLoadAdditionalSignals(): Promise<void> {
   if (!process.env.AQ_TOKEN) return;
+
   try {
-    await requestQuestathon("/api/public/v1/signals");
-    await requestQuestathon("/api/public/v1/schema");
-    await requestQuestathon("/api/public/v1/pack/A/all");
-    await requestQuestathon("/api/public/v1/pack/B/all");
+    await requestQuestathon('/api/public/v1/signals');
+    await requestQuestathon('/api/public/v1/schema');
+    await requestQuestathon('/api/public/v1/pack/A/all');
+    await requestQuestathon('/api/public/v1/pack/B/all');
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown downstream sync error";
+    const message = error instanceof Error ? error.message : 'Unknown downstream sync error';
     cache.lastError = message;
   }
 }
@@ -557,17 +690,17 @@ export async function processQueuedRequests(): Promise<boolean> {
   const item = await lockNextQueuedRequest();
   if (!item) return false;
 
-  const baseUrl = process.env.QUESTATHON_BASE_URL || "https://questathon.aihackerscollective.com";
+  const baseUrl = process.env.QUESTATHON_BASE_URL || 'https://questathon.aihackerscollective.com';
 
   try {
     const response = await fetch(`${baseUrl}${item.endpoint}`, {
       method: item.method,
       headers: {
         Authorization: `Bearer ${process.env.AQ_TOKEN}`,
-        "Content-Type": "application/json",
+        'Content-Type': 'application/json',
       },
       body: item.payload ? JSON.stringify(item.payload) : undefined,
-      cache: "no-store",
+      cache: 'no-store',
     });
 
     if (!response.ok) {
@@ -577,7 +710,7 @@ export async function processQueuedRequests(): Promise<boolean> {
     await finishQueuedRequest(item.id, true);
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown request queue failure";
+    const message = error instanceof Error ? error.message : 'Unknown request queue failure';
     await finishQueuedRequest(item.id, false, message);
     return false;
   }
@@ -587,11 +720,11 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
   await ensureDatabaseReady();
 
   if (!process.env.AQ_TOKEN || !process.env.QUESTATHON_BASE_URL) {
-    const fallback = await loadPersistenceState<DashboardSnapshot>("questathon-dashboard", {
+    const fallback = await loadPersistenceState<DashboardSnapshot>(DASHBOARD_CACHE_KEY, {
       accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
       lastSyncedAt: null,
-      status: "idle",
-      message: "No AQ_TOKEN configured. Server-side sync is disabled until a valid token is supplied.",
+      status: 'idle',
+      message: 'No AQ_TOKEN configured. Server-side sync is disabled until a valid token is supplied.',
       rateLimit: {
         perMinute: 1,
         nextAvailableAt: null,
@@ -604,72 +737,118 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
 
   await processQueuedRequests();
 
-  const cached = await loadCacheEntry<DashboardSnapshot>("questathon-dashboard");
-  if (cached && cached.lastSyncedAt) {
+  const cached = await loadCacheEntry<DashboardSnapshot>(DASHBOARD_CACHE_KEY);
+  const lockState = await loadPersistenceState<boolean>(REFRESH_IN_FLIGHT_KEY, false);
+  const rateState = await getRateLimitState();
+  const nextAvailableAtMs = rateState.lastRequestAt ? rateState.lastRequestAt + RATE_LIMIT_MS : null;
+
+  if (cached && cached.lastSyncedAt && isDashboardSnapshotValid(cached)) {
     cache.data = cached;
     cache.lastUpdated = Date.now();
     return cached;
   }
 
-  if (cache.pendingPromise) {
-    return (await cache.pendingPromise) ?? {
-      accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
-      lastSyncedAt: null,
-      status: "idle",
-      message: "Server-side sync is queued.",
-      rateLimit: {
-        perMinute: 1,
-        nextAvailableAt: cache.nextRequestAt ? new Date(cache.nextRequestAt).toISOString() : null,
-        lastRequestAt: cache.lastRequestAt ? new Date(cache.lastRequestAt).toISOString() : null,
-      },
-    };
+  const invalidDecision = decideDashboardRefresh(cached ?? null, {
+    inFlight: lockState || !!cache.pendingPromise,
+    nowMs: Date.now(),
+    nextAvailableAtMs,
+  });
+
+  if (invalidDecision.action === 'stale') {
+    cache.data = invalidDecision.snapshot ?? cached ?? null;
+    cache.lastUpdated = Date.now();
+    return invalidDecision.snapshot ?? cached ?? buildStaleSnapshot(null, 'Questathon dashboard snapshot is stale and waiting for refresh.', nextAvailableAtMs, rateState.lastRequestAt);
   }
 
-  cache.pendingPromise = (async () => {
+  if (cache.pendingPromise) {
+    return await cache.pendingPromise;
+  }
+
+  const inFlightGuard = async (): Promise<DashboardSnapshot> => {
     try {
+      await savePersistenceState(REFRESH_IN_FLIGHT_KEY, true);
       const accounts = await fetchAndNormalizeExport();
       await maybeLoadAdditionalSignals();
 
-      const snapshot: DashboardSnapshot = {
+      const validationSnapshot: DashboardSnapshot = {
         accounts,
         lastSyncedAt: new Date().toISOString(),
-        status: "ready",
-        message: "Questathon sync completed. Values are limited to data returned by the upstream API.",
-        rateLimit: {
-          perMinute: 1,
-          nextAvailableAt: cache.nextRequestAt ? new Date(cache.nextRequestAt).toISOString() : null,
-          lastRequestAt: cache.lastRequestAt ? new Date(cache.lastRequestAt).toISOString() : null,
-        },
+        status: isDashboardSnapshotValid({
+          accounts,
+          lastSyncedAt: new Date().toISOString(),
+          status: "ready",
+          message: "",
+          rateLimit: { perMinute: 1, nextAvailableAt: null, lastRequestAt: null },
+        })
+          ? "ready"
+          : "error",
+        message: isDashboardSnapshotValid({
+          accounts,
+          lastSyncedAt: new Date().toISOString(),
+          status: "ready",
+          message: "",
+          rateLimit: { perMinute: 1, nextAvailableAt: null, lastRequestAt: null },
+        })
+          ? "Questathon sync completed. Values are limited to data returned by the upstream API."
+          : "Questathon refresh failed validation: both target account names and IDs remain unknown.",
+        rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
       };
 
-      await saveCacheEntry("questathon-dashboard", snapshot, 300000);
-      await savePersistenceState("questathon-dashboard", snapshot);
-      cache.data = snapshot;
+      if (!isDashboardSnapshotValid(validationSnapshot)) {
+        const preserved = cached ?? {
+          accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+          lastSyncedAt: null,
+          status: "error",
+          message: "Questathon refresh failed validation: both target account names and IDs remain unknown.",
+          rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
+        };
+
+        const invalid: DashboardSnapshot = {
+          ...preserved,
+          status: "error",
+          message: "Questathon refresh failed validation: both target account names and IDs remain unknown. Previous snapshot preserved for diagnosis.",
+          rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
+        };
+
+        cache.data = invalid;
+        cache.lastUpdated = Date.now();
+        return invalid;
+      }
+
+      await saveCacheEntry(DASHBOARD_CACHE_KEY, validationSnapshot, 300000);
+      await savePersistenceState(DASHBOARD_CACHE_KEY, validationSnapshot);
+      cache.data = validationSnapshot;
       cache.lastUpdated = Date.now();
       cache.lastError = null;
-      return snapshot;
+      return validationSnapshot;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown sync failure";
-      const snapshot: DashboardSnapshot = {
+      const preserved = cached ?? {
         accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
-        lastSyncedAt: cache.data?.lastSyncedAt ?? null,
+        lastSyncedAt: null,
         status: "error",
         message,
-        rateLimit: {
-          perMinute: 1,
-          nextAvailableAt: cache.nextRequestAt ? new Date(cache.nextRequestAt).toISOString() : null,
-          lastRequestAt: cache.lastRequestAt ? new Date(cache.lastRequestAt).toISOString() : null,
-        },
+        rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
       };
-      await savePersistenceState("questathon-dashboard", snapshot);
+
+      const snapshot: DashboardSnapshot = {
+        ...preserved,
+        status: "error",
+        message: `Questathon sync failed: ${message}. Previous snapshot preserved for diagnosis.`,
+        rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
+      };
+
       cache.data = snapshot;
+      cache.lastUpdated = Date.now();
       cache.lastError = message;
       return snapshot;
     } finally {
       cache.pendingPromise = null;
+      await savePersistenceState(REFRESH_IN_FLIGHT_KEY, false);
     }
-  })();
+  };
 
+  cache.pendingPromise = inFlightGuard();
   return await cache.pendingPromise;
 }
 
@@ -680,15 +859,37 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
     return cache.data;
   }
 
-  const databaseCached = await loadCacheEntry<DashboardSnapshot>("questathon-dashboard");
-  if (databaseCached && databaseCached.lastSyncedAt) {
+  const databaseCached = await loadCacheEntry<DashboardSnapshot>(DASHBOARD_CACHE_KEY);
+  if (databaseCached && databaseCached.lastSyncedAt && isDashboardSnapshotValid(databaseCached)) {
     cache.data = databaseCached;
     cache.lastUpdated = Date.now();
     return databaseCached;
   }
 
-  const snapshot = await syncQuestathonData();
-  return snapshot;
+  if (databaseCached && databaseCached.lastSyncedAt) {
+    const refreshLock = await loadPersistenceState<boolean>(REFRESH_IN_FLIGHT_KEY, false);
+    const rateState = await getRateLimitState();
+    const nextAvailableAtMs = rateState.lastRequestAt ? rateState.lastRequestAt + RATE_LIMIT_MS : null;
+    const decision = decideDashboardRefresh(databaseCached, {
+      inFlight: refreshLock || !!cache.pendingPromise,
+      nowMs: Date.now(),
+      nextAvailableAtMs: nextAvailableAtMs,
+    });
+
+    if (decision.action === 'stale') {
+      cache.data = decision.snapshot ?? databaseCached;
+      cache.lastUpdated = Date.now();
+      return decision.snapshot ?? databaseCached;
+    }
+
+    if (decision.action === 'reuse') {
+      cache.data = decision.snapshot ?? databaseCached;
+      cache.lastUpdated = Date.now();
+      return decision.snapshot ?? databaseCached;
+    }
+  }
+
+  return syncQuestathonData();
 }
 
 export async function queueNoteWrite(input: {
@@ -736,4 +937,44 @@ export async function getNotesAudit(limit = 10) {
 
     return result.rows;
   });
+}
+
+function getSafeSyncDiagnostics(snapshot: DashboardSnapshot | null, source: { accountMatches?: number; candidateRecords?: number; targetMatches?: number; cacheAgeMs?: number | null; lastError?: string | null } = {}) {
+  return {
+    accountMatches: source.accountMatches ?? 0,
+    candidateRecords: source.candidateRecords ?? 0,
+    targetMatches: source.targetMatches ?? 0,
+    cacheAgeMs: source.cacheAgeMs ?? null,
+    status: snapshot?.status ?? "idle",
+    lastSyncedAt: snapshot?.lastSyncedAt ?? null,
+    totalAccounts: snapshot?.accounts.length ?? 0,
+    lastError: source.lastError ?? cache.lastError ?? null,
+  };
+}
+
+function logSafeSyncDiagnostics(snapshot: DashboardSnapshot | null, source: { accountMatches?: number; candidateRecords?: number; targetMatches?: number; cacheAgeMs?: number | null; lastError?: string | null } = {}) {
+  const info = getSafeSyncDiagnostics(snapshot, source);
+  console.info(
+    `[Questathon] status=${info.status} lastSyncedAt=${info.lastSyncedAt ?? "none"} accountMatches=${info.accountMatches} targetMatches=${info.targetMatches} candidateRecords=${info.candidateRecords} totalAccounts=${info.totalAccounts} cacheAgeMs=${info.cacheAgeMs ?? "n/a"} lastError=${info.lastError ? "present" : "none"}`,
+  );
+}
+
+function getRateLimitWindowEnd(): string | null {
+  if (!cache.lastRequestAt) return null;
+  return new Date(cache.lastRequestAt + 60000).toISOString();
+}
+
+async function withRefreshLock<T>(action: () => Promise<T>): Promise<T> {
+  const lockKey = "questathon-dashboard-refresh-in-flight";
+  const current = await loadPersistenceState<boolean>(lockKey, false);
+  if (current) {
+    throw new Error("Questathon dashboard refresh already in progress.");
+  }
+
+  await savePersistenceState(lockKey, true);
+  try {
+    return await action();
+  } finally {
+    await savePersistenceState(lockKey, false);
+  }
 }
