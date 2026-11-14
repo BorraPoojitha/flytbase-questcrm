@@ -278,10 +278,36 @@ function safeText(value: unknown): string {
 }
 
 function findAccountName(record: Record<string, unknown>): string {
-  return (
-    safeText(record.account ?? record.company ?? record.entity ?? record.name ?? record.account_name ?? record.customer) ||
-    "Unknown account"
-  );
+  const candidateNames = collectCandidateNameValues(record);
+  return candidateNames[0] || "Unknown account";
+}
+
+function collectCandidateNameValues(record: Record<string, unknown>): string[] {
+  const candidateValues = [
+    record.account,
+    record.company,
+    record.entity,
+    record.name,
+    record.account_name,
+    record.customer,
+    readNestedValue(record, ["account", "name"]),
+    readNestedValue(record, ["company", "name"]),
+    readNestedValue(record, ["entity", "name"]),
+    readNestedValue(record, ["customer", "name"]),
+  ];
+
+  return candidateValues
+    .flatMap((value) => {
+      if (typeof value === "string") return [value];
+      if (value && typeof value === "object") {
+        const nested = value as Record<string, unknown>;
+        const nestedName = nested.name ?? nested.account ?? nested.company ?? nested.entity ?? nested.customer ?? nested.account_name;
+        if (typeof nestedName === "string") return [nestedName];
+      }
+      return [];
+    })
+    .map((value) => toStringValue(value).trim())
+    .filter((value): value is string => !!value && value !== UNKNOWN_VALUE);
 }
 
 function matchAccountName(name: string): string {
@@ -445,15 +471,7 @@ function buildAccountSet(records: Record<string, unknown>[]): AccountCard[] {
   const byName = new Map<string, Record<string, unknown>>();
 
   records.forEach((record) => {
-    const candidateNames = [
-      findAccountName(record),
-      coerceAccountName(record.account),
-      coerceAccountName(record.company),
-      coerceAccountName(record.entity),
-      coerceAccountName(record.name),
-      coerceAccountName(record.account_name),
-      coerceAccountName(record.customer),
-    ].filter((value): value is string => !!value);
+    const candidateNames = collectCandidateNameValues(record);
 
     for (const candidate of candidateNames) {
       const matched = matchAccountName(candidate);
@@ -516,13 +534,7 @@ async function fetchAndNormalizeExport(): Promise<AccountCard[]> {
   const exportPayload = await requestQuestathon<Record<string, unknown> | Record<string, unknown>[] | unknown[]>("/api/public/v1/export");
   if (!exportPayload) return ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
 
-  const items = Array.isArray(exportPayload)
-    ? exportPayload
-    : Array.isArray((exportPayload as Record<string, unknown>).data)
-      ? ((exportPayload as Record<string, unknown>).data as Record<string, unknown>[])
-      : toRecordList((exportPayload as Record<string, unknown>).records ?? (exportPayload as Record<string, unknown>).items ?? (exportPayload as Record<string, unknown>).results);
-
-  const normalized = buildAccountSet(items.map((item) => item as Record<string, unknown>));
+  const normalized = normalizeAccountPayload(exportPayload);
   return normalized.length > 0 ? normalized : ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
 }
 
