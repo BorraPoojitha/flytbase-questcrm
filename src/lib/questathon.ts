@@ -490,8 +490,21 @@ function buildAccountSet(records: Record<string, unknown>[]): AccountCard[] {
 
 function normalizeAccountPayload(exportPayload: unknown): AccountCard[] {
   const candidateRecords = extractExportRecords(exportPayload);
-  const targetRecords = candidateRecords.filter((record) => recordMatchesTargetAccount(record));
-  const normalized = buildAccountSet(targetRecords.length > 0 ? targetRecords : candidateRecords);
+  const directAccountNodes = Array.isArray(exportPayload) ? exportPayload : ((exportPayload as Record<string, unknown>)?.accounts ?? []);
+  const accountLists = Array.isArray(directAccountNodes) ? directAccountNodes : [];
+  const effectiveRecords = accountLists.length > 0 ? accountLists : candidateRecords;
+
+  const targetRecords = effectiveRecords.filter((record) => {
+    if (!record || typeof record !== "object") return false;
+    const nameValue = record.name ?? (record as Record<string, unknown>).account ?? (record as Record<string, unknown>).company ?? (record as Record<string, unknown>).entity;
+    const idValue = (record as Record<string, unknown>).id ?? (record as Record<string, unknown>).account_id ?? (record as Record<string, unknown>).accountId;
+    if (typeof nameValue === "string" && typeof idValue === "string") {
+      return ACCOUNT_NAMES.some((target) => target.toLowerCase() === String(nameValue).toLowerCase());
+    }
+    return recordMatchesTargetAccount(record as Record<string, unknown>);
+  });
+
+  const normalized = buildAccountSet(targetRecords.length > 0 ? targetRecords : effectiveRecords);
 
   const matches = normalized.length > 0 ? normalized : ACCOUNT_NAMES.map((name) => buildEmptyAccount(name));
   const readySnapshot: DashboardSnapshot = {
@@ -518,6 +531,58 @@ const DASHBOARD_CACHE_KEY = "questathon-dashboard";
 const REFRESH_IN_FLIGHT_KEY = "questathon-dashboard-refresh-in-flight";
 const LAST_REQUEST_AT_KEY = "questathon-last-request-at";
 const RATE_LIMIT_MS = 60000;
+const REFRESH_LOCK_TTL_MS = 180000;
+
+type RefreshLockState = {
+  active: boolean;
+  lockedAt: number | null;
+  expiresAt: number | null;
+};
+
+const EMPTY_REFRESH_LOCK: RefreshLockState = {
+  active: false,
+  lockedAt: null,
+  expiresAt: null,
+};
+
+function isRefreshLockActive(lockState: RefreshLockState | boolean | null | undefined): boolean {
+  if (typeof lockState === "boolean") return lockState;
+  if (!lockState || !lockState.active) return false;
+  if (!lockState.expiresAt) return true;
+  return Date.now() < lockState.expiresAt;
+}
+
+async function getRefreshLockState(): Promise<RefreshLockState> {
+  const state = await loadPersistenceState<RefreshLockState>(REFRESH_IN_FLIGHT_KEY, EMPTY_REFRESH_LOCK);
+  if (!state.active) {
+    return EMPTY_REFRESH_LOCK;
+  }
+
+  if (state.expiresAt && Date.now() > state.expiresAt) {
+    return EMPTY_REFRESH_LOCK;
+  }
+
+  return state;
+}
+
+async function acquireRefreshLock(): Promise<boolean> {
+  const now = Date.now();
+  const current = await getRefreshLockState();
+  if (isRefreshLockActive(current)) {
+    return false;
+  }
+
+  await savePersistenceState(REFRESH_IN_FLIGHT_KEY, {
+    active: true,
+    lockedAt: now,
+    expiresAt: now + REFRESH_LOCK_TTL_MS,
+  });
+  return true;
+}
+
+async function releaseRefreshLock(): Promise<void> {
+  await savePersistenceState(REFRESH_IN_FLIGHT_KEY, EMPTY_REFRESH_LOCK);
+}
 
 function buildRateLimit(rateLimit: { perMinute: number; nextAvailableAt: string | null; lastRequestAt: string | null }): DashboardSnapshot["rateLimit"] {
   return {
@@ -738,7 +803,7 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
   await processQueuedRequests();
 
   const cached = await loadCacheEntry<DashboardSnapshot>(DASHBOARD_CACHE_KEY);
-  const lockState = await loadPersistenceState<boolean>(REFRESH_IN_FLIGHT_KEY, false);
+  const lockState = await getRefreshLockState();
   const rateState = await getRateLimitState();
   const nextAvailableAtMs = rateState.lastRequestAt ? rateState.lastRequestAt + RATE_LIMIT_MS : null;
 
@@ -749,7 +814,7 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
   }
 
   const invalidDecision = decideDashboardRefresh(cached ?? null, {
-    inFlight: lockState || !!cache.pendingPromise,
+    inFlight: isRefreshLockActive(lockState) || !!cache.pendingPromise,
     nowMs: Date.now(),
     nextAvailableAtMs,
   });
@@ -766,7 +831,31 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
 
   const inFlightGuard = async (): Promise<DashboardSnapshot> => {
     try {
-      await savePersistenceState(REFRESH_IN_FLIGHT_KEY, true);
+      const acquired = await acquireRefreshLock();
+      if (!acquired) {
+        const activeLock = await getRefreshLockState();
+        const staleSnapshot = cached ?? {
+          accounts: ACCOUNT_NAMES.map((name) => buildEmptyAccount(name)),
+          lastSyncedAt: null,
+          status: "stale",
+          message: "A Questathon fetch is already running. Waiting for the latest data.",
+          rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
+        };
+
+        const snapshot = {
+          ...staleSnapshot,
+          status: "stale",
+          message: isRefreshLockActive(activeLock)
+            ? "A Questathon fetch is already running. Waiting for the latest data."
+            : "The previous refresh lock expired; another sync will start shortly.",
+          rateLimit: statusRateLimit(nextAvailableAtMs, rateState.lastRequestAt ?? cache.lastRequestAt ?? null),
+        } as DashboardSnapshot;
+
+        cache.data = snapshot;
+        cache.lastUpdated = Date.now();
+        return snapshot;
+      }
+
       const accounts = await fetchAndNormalizeExport();
       await maybeLoadAdditionalSignals();
 
@@ -844,7 +933,7 @@ export async function syncQuestathonData(): Promise<DashboardSnapshot> {
       return snapshot;
     } finally {
       cache.pendingPromise = null;
-      await savePersistenceState(REFRESH_IN_FLIGHT_KEY, false);
+      await releaseRefreshLock();
     }
   };
 
@@ -867,11 +956,11 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
   }
 
   if (databaseCached && databaseCached.lastSyncedAt) {
-    const refreshLock = await loadPersistenceState<boolean>(REFRESH_IN_FLIGHT_KEY, false);
+    const refreshLock = await getRefreshLockState();
     const rateState = await getRateLimitState();
     const nextAvailableAtMs = rateState.lastRequestAt ? rateState.lastRequestAt + RATE_LIMIT_MS : null;
     const decision = decideDashboardRefresh(databaseCached, {
-      inFlight: refreshLock || !!cache.pendingPromise,
+      inFlight: isRefreshLockActive(refreshLock) || !!cache.pendingPromise,
       nowMs: Date.now(),
       nextAvailableAtMs: nextAvailableAtMs,
     });
